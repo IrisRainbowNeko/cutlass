@@ -1,5 +1,7 @@
 ![ALT](/media/images/gemm-hierarchy-with-epilogue-no-labels.png "Complete CUDA GEMM decomposition")
 
+Fix in PyTorch2.5 + CUDA12.4
+
 # CUTLASS 2.4
 
 _CUTLASS 2.4 - November 2020_
