@@ -211,7 +211,7 @@ torch::Tensor backward_filter_fp32(
 
     options.update(
         {input.size(0), input.size(2), input.size(3), input.size(1)},
-        {weight.size(0), weight.size(2), weight.size(3), 1});
+        {weight.size(0), weight.size(2), weight.size(3), 1L});
 
 
     cutlass::TensorRef<ElementSrc, LayoutSrc> d_src((ElementSrc*)input.data_ptr(),

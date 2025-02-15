@@ -190,7 +190,7 @@ torch::Tensor backward_data_fp16(torch::Tensor input, torch::Tensor weight) {
     Options options = Options();
 
     options.update({input.size(0), input.size(2), input.size(3), input.size(1)},
-                   {weight.size(0), weight.size(2), weight.size(3), 1});
+                   {weight.size(0), weight.size(2), weight.size(3), 1L});
 
     cutlass::TensorRef<ElementSrc, LayoutSrc> d_src(
             (ElementSrc*)input.data_ptr(),
@@ -218,8 +218,8 @@ torch::Tensor backward_data_fp16(torch::Tensor input, torch::Tensor weight) {
              split_k_slices, options.filter_size.n()},
             d_src,     // tensor_src.device_ref(),
             d_filter,  // tensor_filter.device_ref(),
-            NULL,      // tensor_bias.device_ref(),
-            NULL,      // tensor_z.device_ref(),
+            {nullptr, LayoutDst()},  // tensor_bias.device_ref(),
+            {nullptr, LayoutDst()},  // tensor_z.device_ref(),
             d_dst,     // tensor_dst.device_ref(),
             {options.alpha, ElementComputeEpilogue(0), options.beta}};
 
