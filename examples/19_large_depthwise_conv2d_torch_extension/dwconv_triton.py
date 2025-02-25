@@ -6,12 +6,13 @@ import triton.language as tl
 # 针对特定卷积核尺寸和硬件优化的版本
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_H': 4, 'BLOCK_W': 4, 'BLOCK_C': 32}),
-        triton.Config({'BLOCK_H': 4, 'BLOCK_W': 8, 'BLOCK_C': 32}),
-        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 4, 'BLOCK_C': 32}),
-        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8, 'BLOCK_C': 32}),
-        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8, 'BLOCK_C': 64}),
-        triton.Config({'BLOCK_H': 16, 'BLOCK_W': 16, 'BLOCK_C': 32}),
+        # 针对大通道的优化配置
+        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8, 'BLOCK_C': 128}, num_warps=4),
+        triton.Config({'BLOCK_H': 16, 'BLOCK_W': 16, 'BLOCK_C': 64}, num_warps=4),
+        triton.Config({'BLOCK_H': 8, 'BLOCK_W': 8, 'BLOCK_C': 256}, num_warps=8),
+        # 针对中等空间尺寸的配置
+        triton.Config({'BLOCK_H': 32, 'BLOCK_W': 32, 'BLOCK_C': 32}, num_warps=8),
+        triton.Config({'BLOCK_H': 16, 'BLOCK_W': 16, 'BLOCK_C': 64}, num_warps=4),
     ],
     key=['batch', 'height', 'width', 'channels', 'kernel_h', 'kernel_w'],
 )
@@ -22,87 +23,86 @@ def _depthwise_conv_kernel_optimized(
     out_height, out_width,
     kernel_h, kernel_w, stride_h, stride_w, padding_h, padding_w, dilation_h, dilation_w,
     BLOCK_H: tl.constexpr, BLOCK_W: tl.constexpr, BLOCK_C: tl.constexpr,
-    KH_BLOCK=4, KW_BLOCK=4
 ):
-    # 维度分解
+    # 三维并行化：空间维度 + 通道/批次组合维度
     pid_h = tl.program_id(0)
     pid_w = tl.program_id(1)
-    pid_batch_c = tl.program_id(2)
+    pid_cb = tl.program_id(2)
     
-    # 分解批次和通道维度
-    pid_batch = pid_batch_c // tl.cdiv(channels, BLOCK_C)
-    pid_c = pid_batch_c % tl.cdiv(channels, BLOCK_C)
+    # 分解组合维度
+    num_channel_blocks = tl.cdiv(channels, BLOCK_C)
+    pid_batch = pid_cb // num_channel_blocks
+    pid_c = pid_cb % num_channel_blocks
     
     # 边界检查
-    if pid_batch >= batch:
-        return
-    if pid_c * BLOCK_C >= channels:
+    if pid_batch >= batch or pid_c * BLOCK_C >= channels:
         return
     
-    # 初始化位置参数
+    # 计算初始位置
     c_start = pid_c * BLOCK_C
-    c_end = tl.minimum(c_start + BLOCK_C, channels)
-    c_mask = tl.arange(0, BLOCK_C) < (c_end - c_start)
+    c_mask = (tl.arange(0, BLOCK_C) < channels - c_start)
     
-    h_start = pid_h * BLOCK_H
-    w_start = pid_w * BLOCK_W
+    # 空间位置计算（使用更大的块处理中等尺寸空间）
+    h_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    w_offsets = pid_w * BLOCK_W + tl.arange(0, BLOCK_W)
     
+    # 输入特征图起始位置
     batch_offset = pid_batch * height * width * channels
     
-    # 重构后的循环结构（支持Triton JIT）
-    for h_offset in range(BLOCK_H):
-        h = h_start + h_offset
-        # 改写为条件判断代替break
-        if h < out_height:
-            for w_offset in range(BLOCK_W):
-                w = w_start + w_offset
-                if w < out_width:  # 有效位置判断
-                    # 输入起始位置计算
-                    in_h = h * stride_h - padding_h
-                    in_w = w * stride_w - padding_w
-                    
-                    acc = tl.zeros([BLOCK_C], dtype=tl.float32)
-                    
-                    # 卷积核循环
-                    for kh in range(kernel_h):
-                        ih = in_h + kh
-                        # 显式边界检查
-                        if ih >= 0 and ih < height:
-                            for kw in range(kernel_w):
-                                iw = in_w + kw
-                                if iw >= 0 and iw < width:
-                                    # 输入数据访问
-                                    input_offset = (
-                                        batch_offset + 
-                                        ih * width * channels + 
-                                        iw * channels + 
-                                        c_start + tl.arange(0, BLOCK_C)
-                                    )
-                                    x = tl.load(input_ptr + input_offset, mask=c_mask, other=0.0)
-                                    
-                                    # 权重访问（通道优先布局）
-                                    # weight_offset = (
-                                    #     (c_start + tl.arange(0, BLOCK_C)) * kernel_h * kernel_w + 
-                                    #     kh * kernel_w + 
-                                    #     kw
-                                    # )
-                                    weight_offset = (
-                                        kh * kernel_w * channels +  # 当前kernel行偏移
-                                        kw * channels +             # 当前kernel列偏移
-                                        c_start + tl.arange(0, BLOCK_C)  # 通道偏移
-                                    )
-                                    w_val = tl.load(weight_ptr + weight_offset, mask=c_mask, other=0.0)
-                                    
-                                    acc += x * w_val
-                    
-                    # 结果存储
-                    output_offset = (
-                        batch_offset + 
-                        h * out_width * channels + 
-                        w * channels + 
-                        c_start + tl.arange(0, BLOCK_C)
-                    )
-                    tl.store(output_ptr + output_offset, acc, mask=c_mask)
+    # 使用三维张量存储累加器，利用寄存器重用
+    acc = tl.zeros((BLOCK_H, BLOCK_W, BLOCK_C), dtype=tl.float32)
+    
+    # 卷积核循环展开（支持任意尺寸卷积核）
+    for kh in range(kernel_h):
+        for kw in range(kernel_w):
+            # 带dilation的坐标计算
+            ih_base = h_offsets * stride_h - padding_h + kh * dilation_h
+            iw_base = w_offsets * stride_w - padding_w + kw * dilation_w
+            
+            # 创建空间掩码（处理边界）
+            h_mask = (ih_base >= 0) & (ih_base < height)
+            w_mask = (iw_base >= 0) & (iw_base < width)
+            space_mask = h_mask[:, None] & w_mask[None, :]  # 外积生成2D掩码
+            
+            # 输入数据加载（带空间掩码）
+            input_ptrs = (
+                batch_offset + 
+                (ih_base[:, None, None] * width * channels) + 
+                (iw_base[None, :, None] * channels) + 
+                (c_start + tl.arange(0, BLOCK_C)[None, None, :])
+            )
+            inputs = tl.load(input_ptr + input_ptrs, 
+                           mask=(space_mask[:, :, None] & c_mask[None, None, :]), 
+                           other=0.0)
+            
+            # 权重加载（优化内存布局）
+            weight_ptrs = (
+                kh * kernel_w * channels + 
+                kw * channels + 
+                c_start + tl.arange(0, BLOCK_C)
+            )
+            weights = tl.load(weight_ptr + weight_ptrs, mask=c_mask, other=0.0)
+            
+            # 矩阵累加（利用广播机制）
+            acc += inputs * weights
+    
+    # 计算输出位置并存储
+    h_out_offsets = tl.where(h_offsets < out_height, h_offsets, 0)
+    w_out_offsets = tl.where(w_offsets < out_width, w_offsets, 0)
+    
+    output_ptrs = (
+        pid_batch * out_height * out_width * channels + 
+        h_out_offsets[:, None, None] * out_width * channels + 
+        w_out_offsets[None, :, None] * channels + 
+        (c_start + tl.arange(0, BLOCK_C)[None, None, :])
+    )
+    
+    output_mask = (
+        (h_offsets[:, None, None] < out_height) & 
+        (w_offsets[None, :, None] < out_width) & 
+        (c_mask[None, None, :])
+    )
+    tl.store(output_ptr + output_ptrs, acc, mask=output_mask)
 
 
 class OptimizedDepthwiseConv2d(torch.nn.Module):
@@ -149,45 +149,32 @@ class OptimizedDepthwiseConv2d(torch.nn.Module):
         batch, height, width, channels = x.shape
         
         # 计算输出维度
-        out_height = (height + 2 * self.padding[0] - self.dilation[0] * (self.kernel_size[0] - 1) - 1) // self.stride[0] + 1
-        out_width = (width + 2 * self.padding[1] - self.dilation[1] * (self.kernel_size[1] - 1) - 1) // self.stride[1] + 1
+        out_height = (x.shape[1] + 2 * self.padding[0] - 
+                     self.dilation[0] * (self.kernel_size[0] - 1) - 1) // self.stride[0] + 1
+        out_width = (x.shape[2] + 2 * self.padding[1] - 
+                    self.dilation[1] * (self.kernel_size[1] - 1) - 1) // self.stride[1] + 1
         
-        # 创建输出tensor
-        output = torch.empty((batch, out_height, out_width, channels), device=x.device, dtype=self.dtype)
+        output = torch.empty((x.shape[0], out_height, out_width, self.channels),
+                           device=x.device, dtype=self.dtype)
         
-        # 计算网格维度 - 根据计算量动态调整
-        grid = (
-            triton.cdiv(out_height, 8),  # 默认值，会被autotune覆盖
-            triton.cdiv(out_width, 8),   # 默认值，会被autotune覆盖
-            batch * triton.cdiv(channels, 32)  # 默认值，会被autotune覆盖
-        )
+        # 动态网格划分策略
+        def grid(meta):
+            return (
+                triton.cdiv(out_height, meta['BLOCK_H']),
+                triton.cdiv(out_width, meta['BLOCK_W']),
+                x.shape[0] * triton.cdiv(self.channels, meta['BLOCK_C'])
+            )
         
-        # 为大卷积核选择合适的块大小
-        kh_block = 4
-        kw_block = 4
-        
-        if min(self.kernel_size) <= 3:
-            # 小卷积核不需要分块
-            kh_block = self.kernel_size[0]
-            kw_block = self.kernel_size[1]
-        elif max(self.kernel_size) >= 13:
-            # 大卷积核使用更小的块
-            kh_block = 4
-            kw_block = 4
-        
-        # 启动triton kernel并进行自动调优
+        # 启动优化后的kernel
         _depthwise_conv_kernel_optimized[grid](
             x, self.weight, output,
-            batch, height, width, channels,
+            x.shape[0], x.shape[1], x.shape[2], self.channels,
             out_height, out_width,
             self.kernel_size[0], self.kernel_size[1],
             self.stride[0], self.stride[1],
             self.padding[0], self.padding[1],
             self.dilation[0], self.dilation[1],
-            KH_BLOCK=kh_block,
-            KW_BLOCK=kw_block
         )
-        
         return output
 
 
