@@ -34,7 +34,6 @@ def _depthwise_conv_kernel_optimized(
     pid_batch = pid_cb // num_channel_blocks
     pid_c = pid_cb % num_channel_blocks
     
-    # 边界检查
     if pid_batch >= batch or pid_c * BLOCK_C >= channels:
         return
     
@@ -52,7 +51,7 @@ def _depthwise_conv_kernel_optimized(
     # 使用三维张量存储累加器，利用寄存器重用
     acc = tl.zeros((BLOCK_H, BLOCK_W, BLOCK_C), dtype=tl.float32)
     
-    # 卷积核循环展开（支持任意尺寸卷积核）
+    # 卷积核循环展开，加速运算（支持任意尺寸卷积核）
     for kh in range(kernel_h):
         for kw in range(kernel_w):
             # 带dilation的坐标计算
@@ -62,7 +61,7 @@ def _depthwise_conv_kernel_optimized(
             # 创建空间掩码（处理边界）
             h_mask = (ih_base >= 0) & (ih_base < height)
             w_mask = (iw_base >= 0) & (iw_base < width)
-            space_mask = h_mask[:, None] & w_mask[None, :]  # 外积生成2D掩码
+            space_mask = h_mask[:, None] & w_mask[None, :]  # 逻辑运算+广播加速
             
             # 输入数据加载（带空间掩码）
             input_ptrs = (
